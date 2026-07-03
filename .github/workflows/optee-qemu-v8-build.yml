@@ -36,11 +36,15 @@ jobs:
       fail-fast: false
       matrix:
         variant: [release, debug_asan]
-    if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == matrix.variant }}
     runs-on: ubuntu-22.04
     timeout-minutes: 150
 
     steps:
+      - name: Declare build type
+        if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == matrix.variant }}
+        run: |
+          echo "Building ${{ matrix.variant }}"
+
       - name: Install build prerequisites
         run: |
           sudo apt-get update
