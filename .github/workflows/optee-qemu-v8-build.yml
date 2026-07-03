@@ -1,0 +1,291 @@
+name: Build OP-TEE for QEMU v8 (AArch64)
+
+# Manual only. Produces a downloadable tarball of everything needed to boot
+# OP-TEE under QEMU (firmware, kernel, rootfs, and the patched QEMU binary
+# itself).
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "manifest.git branch/tag to build (blank = master/latest)"
+        required: false
+        default: ""
+      build_variant:
+        description: "Which variant(s) to build"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - release
+          - debug_asan
+      run_xtest:
+        description: "Also run the full xtest suite under QEMU (make check) before packaging"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  MANIFEST: qemu_v8.xml
+  MANIFEST_BRANCH: ${{ github.event.inputs.branch }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [release, debug_asan]
+    if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == matrix.variant }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            adb acpica-tools autoconf automake bc bison build-essential \
+            ccache cpio cscope curl device-tree-compiler e2tools expect \
+            fastboot flex ftp-upload gdisk git libgnutls28-dev libattr1-dev \
+            libcap-ng-dev libfdt-dev libftdi-dev libglib2.0-dev libgmp3-dev \
+            libhidapi-dev libmpc-dev libncurses5-dev libpixman-1-dev \
+            libslirp-dev libssl-dev libtool libusb-1.0-0-dev make mtools \
+            netcat-openbsd ninja-build python3-cryptography python3-pip \
+            python3-pyelftools python3-serial python3-tomli python-is-python3 \
+            rsync swig unzip uuid-dev wget xdg-utils xsltproc xterm xz-utils \
+            zlib1g-dev patchelf
+
+      - name: Install the Android "repo" tool
+        run: |
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /tmp/repo
+          chmod a+x /tmp/repo
+          sudo mv /tmp/repo /usr/local/bin/repo
+
+      - name: Configure git identity (required by repo)
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "GitHub Actions"
+
+      - name: Cache repo forest
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/optee-project-${{ matrix.variant }}
+          key: optee-qemuv8-${{ matrix.variant }}-${{ env.MANIFEST_BRANCH }}-${{ github.sha }}
+          restore-keys: |
+            optee-qemuv8-${{ matrix.variant }}-${{ env.MANIFEST_BRANCH }}-
+            optee-qemuv8-${{ matrix.variant }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: optee-qemuv8-ccache-${{ matrix.variant }}-${{ github.sha }}
+          restore-keys: |
+            optee-qemuv8-ccache-${{ matrix.variant }}-
+
+      - name: repo init
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          mkdir -p "$OPTEE_DIR"
+          cd "$OPTEE_DIR"
+          if [ -n "$MANIFEST_BRANCH" ]; then
+            repo init -u https://github.com/OP-TEE/manifest.git -m "$MANIFEST" -b "$MANIFEST_BRANCH"
+          else
+            repo init -u https://github.com/OP-TEE/manifest.git -m "$MANIFEST"
+          fi
+
+      - name: repo sync
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          cd "$OPTEE_DIR"
+          repo sync -j"$(nproc)" --no-clone-bundle
+
+      - name: Build toolchains
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          cd "$OPTEE_DIR/build"
+          make -j"$(nproc)" toolchains
+
+      # release: stock optee_os config as shipped by the qemu_v8.xml manifest.
+      # debug_asan: DEBUG build with OP-TEE core (KASan-equivalent) and TA
+      # userspace ASan enabled, plus verbose core/TA logging - useful for
+      # finding memory-safety bugs.
+      - name: Build OP-TEE (release)
+        if: matrix.variant == 'release'
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          cd "$OPTEE_DIR/build"
+          make -j"$(nproc)"
+
+      - name: Build OP-TEE (debug + ASAN)
+        if: matrix.variant == 'debug_asan'
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          cd "$OPTEE_DIR/build"
+          make -j"$(nproc)" \
+            DEBUG=1 \
+            CFG_TEE_CORE_LOG_LEVEL=4 \
+            CFG_TEE_TA_LOG_LEVEL=4 \
+            OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_CORE_SANITIZE_UADDRESS=y"
+
+      # Optional, off by default: build+boot QEMU headlessly and run xtest.
+      # Reuses whatever DEBUG/ASAN flags were used above since `check` just
+      # depends on `all` having already been built with them.
+      - name: Run xtest via QEMU (make check)
+        if: ${{ github.event.inputs.run_xtest == 'true' }}
+        run: |
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          cd "$OPTEE_DIR/build"
+          make -j"$(nproc)" check
+        env:
+          DUMP_LOGS_ON_ERROR: 1
+
+      - name: Upload xtest logs on failure
+        if: failure() && github.event.inputs.run_xtest == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: optee-qemuv8-${{ matrix.variant }}-xtest-logs
+          path: |
+            ${{ github.workspace }}/optee-project-${{ matrix.variant }}/build/serial0.log
+            ${{ github.workspace }}/optee-project-${{ matrix.variant }}/build/serial1.log
+          if-no-files-found: ignore
+
+      # Package everything needed to boot OP-TEE on a fresh machine: the
+      # boot chain binaries from out/bin (dereferencing the symlinks the
+      # build system creates), the patched qemu-system-aarch64 binary itself
+      # (stock QEMU can't boot OP-TEE's secure-world image), and a
+      # run script + README so nobody has to reverse-engineer the Makefile's
+      # QEMU invocation.
+      - name: Package release bundle
+        run: |
+          set -eu
+          OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
+          STAGE="$RUNNER_TEMP/optee-qemuv8-${{ matrix.variant }}"
+          DEPS_FILE="$RUNNER_TEMP/deps-${{ matrix.variant }}.txt"
+          MANIFEST_BRANCH_ESCAPED=$(printf '%s\n' "$MANIFEST_BRANCH" | sed 's/[`$\]/\\&/g')
+
+          mkdir -p "$STAGE/bin"
+
+          cp -aL "$OPTEE_DIR/out/bin/." "$STAGE/bin/"
+
+          # Find and validate QEMU binary
+          QEMU_BIN="$(find "$OPTEE_DIR/qemu/build" -maxdepth 2 -type f -name qemu-system-aarch64 | head -n1)"
+          if [ -z "$QEMU_BIN" ] || [ ! -f "$QEMU_BIN" ]; then
+            echo "::error::could not find built qemu-system-aarch64"
+            exit 1
+          fi
+          if [ ! -x "$QEMU_BIN" ]; then
+            echo "::error::qemu-system-aarch64 is not executable"
+            exit 1
+          fi
+
+          cp "$QEMU_BIN" "$STAGE/bin/qemu-system-aarch64"
+          strip --strip-unneeded "$STAGE/bin/qemu-system-aarch64" || {
+            echo "::error::Failed to strip qemu-system-aarch64"
+            exit 1
+          }
+
+          # Copy every shared library qemu needs (glib, pixman, slirp, fdt,
+          # gnutls, ...) into ./bin/lib/ and force its RPATH to look there
+          # first. glibc itself (libc, libm, libpthread, ...) is deliberately
+          # left off this list and resolved from the host instead.
+          mkdir -p "$STAGE/bin/lib"
+          ldd "$STAGE/bin/qemu-system-aarch64" | awk '$3 ~ /^\// {print $3}' | sort -u > "$DEPS_FILE"
+
+          while read -r lib; do
+            base="$(basename "$lib")"
+            case "$base" in
+              ld-linux*|linux-vdso*|libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|libresolv.so*|libnsl.so*|libutil.so*)
+                continue ;;
+            esac
+            cp -L "$lib" "$STAGE/bin/lib/$base" || {
+              echo "::error::Failed to copy library $lib"
+              exit 1
+            }
+          done < "$DEPS_FILE"
+
+          # Strip bundled libraries
+          for lib in "$STAGE/bin/lib/"*.so*; do
+            [ -f "$lib" ] && strip --strip-unneeded "$lib" || true
+          done
+
+          # Clean up temporary file
+          rm -f "$DEPS_FILE"
+
+          # Old-style RPATH (not RUNPATH) so it's inherited transitively by
+          # the bundled libs' own dependencies too, e.g. glib -> pcre.
+          patchelf --set-rpath '$ORIGIN/lib' --force-rpath "$STAGE/bin/qemu-system-aarch64" || {
+            echo "::error::Failed to patch RPATH for qemu-system-aarch64"
+            exit 1
+          }
+
+          cat > "$STAGE/run.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Boots this OP-TEE QEMU v8 (AArch64) image.
+          # Normal-world console + QEMU monitor share this terminal (stdio).
+          # Secure-world console is logged to serial1.log in this directory.
+          # Quit with Ctrl-A X, or "quit" at the (qemu) monitor prompt.
+          set -eu
+          cd "$(dirname "$0")/bin"
+          ./qemu-system-aarch64 \
+            -nographic \
+            -smp 2 \
+            -cpu max,sme=on,pauth-impdef=on \
+            -d unimp -semihosting-config enable=on,target=native \
+            -m 1057 \
+            -bios bl1.bin \
+            -initrd rootfs.cpio.gz \
+            -kernel Image \
+            -append 'console=ttyAMA0,38400 keep_bootcon root=/dev/vda2' \
+            -machine virt,acpi=off,secure=on,mte=off,gic-version=3,virtualization=false \
+            -serial mon:stdio -serial file:../serial1.log
+          EOF
+          chmod +x "$STAGE/run.sh"
+
+          ASAN_NOTE=""
+          if [ "${{ matrix.variant }}" = "debug_asan" ]; then
+            ASAN_NOTE=$(cat <<'NOTE'
+
+          ## debug_asan build
+
+          Built with `DEBUG=1`, verbose core/TA logging, and OP-TEE core +
+          TA userspace AddressSanitizer instrumentation
+          (`CFG_CORE_SANITIZE_KADDRESS=y CFG_CORE_SANITIZE_UADDRESS=y`).
+          Expect ASan reports on stdout/serial1.log if a bug is triggered.
+          Not representative of production OP-TEE performance or timing.
+          NOTE
+          )
+          fi
+
+          cat > "$STAGE/README.md" <<EOF
+          # OP-TEE QEMU v8 (AArch64) - ${{ matrix.variant }} build
+
+          Manifest: qemu_v8.xml (branch: \`${MANIFEST_BRANCH_ESCAPED:-master}\`)
+          Built: $(date -u +%Y-%m-%dT%H:%M:%SZ) from commit ${GITHUB_SHA}
+
+          ## Run it
+
+              ./run.sh
+
+          Once xtest's shell prompt (\`#\`) appears in this terminal, run \`xtest\`
+          to exercise the TEE. Exit QEMU with Ctrl-A X.
+
+          This bundle includes a build of upstream QEMU with OP-TEE's TrustZone
+          patches (\`bin/qemu-system-aarch64\`) - stock QEMU cannot boot this image.
+          Its non-glibc shared library dependencies (glib, pixman, slirp, fdt,
+          gnutls, ...) are bundled in \`bin/lib/\` and it's been patched to look
+          there first, so nothing needs to be installed. It still relies on the
+          host's own glibc/ld.so.
+          $ASAN_NOTE
+          EOF
+
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/optee-qemuv8-${{ matrix.variant }}.tar.gz" "optee-qemuv8-${{ matrix.variant }}"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: optee-qemuv8-${{ matrix.variant }}
+          path: ${{ runner.temp }}/optee-qemuv8-${{ matrix.variant }}.tar.gz
+          retention-days: 30
+
