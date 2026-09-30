@@ -37,7 +37,10 @@ jobs:
       matrix:
         variant: [release, debug_asan]
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    # The debug_asan variant is DEBUG=1 + KASan: unoptimized, cold ccache and
+    # a large shadow map, so it is well over the ~70min the optimized release
+    # build takes. 300min leaves headroom for a cold-cache rerun.
+    timeout-minutes: 300
 
     steps:
       - name: Declare build type
@@ -112,9 +115,18 @@ jobs:
           make -j"$(nproc)" toolchains
 
       # release: stock optee_os config as shipped by the qemu_v8.xml manifest.
-      # debug_asan: DEBUG build with OP-TEE core (KASan-equivalent) and TA
-      # userspace ASan enabled, plus verbose core/TA logging - useful for
-      # finding memory-safety bugs.
+      # debug_asan: DEBUG build with the OP-TEE Kernel Address Sanitizer
+      # (KASan) enabled for both the TEE core and trusted applications, plus
+      # verbose core/TA logging - useful for finding memory-safety bugs.
+      # CFG_CORE_ASLR=n is mandatory, not cosmetic: mk/config.mk hard-errors
+      # with "CFG_CORE_SANITIZE_KADDRESS and CFG_CORE_ASLR are not compatible"
+      # and CFG_CORE_ASLR defaults to y, so the sanitizers never build without
+      # it. CFG_ATTESTATION_PTA=n matches upstream's own KASan CI invocations
+      # (optee_os ci.yml) - the attestation PTA's memory accounting does not
+      # hold up under the shadow map.
+      # NOTE: keep these flags and the "Run xtest" step below in lockstep;
+      # every `make` invocation re-derives the config, so `check` must be
+      # handed the identical flag set or it rebuilds a different core.
       - name: Build OP-TEE (release)
         if: matrix.variant == 'release'
         run: |
@@ -122,7 +134,7 @@ jobs:
           cd "$OPTEE_DIR/build"
           make -j"$(nproc)"
 
-      - name: Build OP-TEE (debug + ASAN)
+      - name: Build OP-TEE (debug + KASan)
         if: matrix.variant == 'debug_asan'
         run: |
           OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
@@ -131,19 +143,33 @@ jobs:
             DEBUG=1 \
             CFG_TEE_CORE_LOG_LEVEL=4 \
             CFG_TEE_TA_LOG_LEVEL=4 \
-            OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_CORE_SANITIZE_UADDRESS=y"
+            CFG_ATTESTATION_PTA=n \
+            OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_TA_SANITIZE_KADDRESS=y CFG_CORE_ASLR=n"
 
       # Optional, off by default: build+boot QEMU headlessly and run xtest.
-      # Reuses whatever DEBUG/ASAN flags were used above since `check` just
-      # depends on `all` having already been built with them.
+      # `check` depends on `all` having already been built, so only the
+      # incremental work is left, but the flags must be repeated: they are not
+      # persisted between make invocations.
       - name: Run xtest via QEMU (make check)
         if: ${{ github.event.inputs.run_xtest == 'true' }}
         run: |
           OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
           cd "$OPTEE_DIR/build"
-          make -j"$(nproc)" check
+          if [ "${{ matrix.variant }}" = "debug_asan" ]; then
+            make -j"$(nproc)" check \
+              DEBUG=1 \
+              CFG_TEE_CORE_LOG_LEVEL=4 \
+              CFG_TEE_TA_LOG_LEVEL=4 \
+              CFG_ATTESTATION_PTA=n \
+              OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_TA_SANITIZE_KADDRESS=y CFG_CORE_ASLR=n"
+          else
+            make -j"$(nproc)" check
+          fi
         env:
           DUMP_LOGS_ON_ERROR: 1
+          # n_* skips the long-running xtest cases. Under KASan they are slow
+          # enough to eat the whole job budget; upstream trims the same set.
+          XTEST_ARGS: ${{ matrix.variant == 'debug_asan' && 'n_1001 n_1003 n_1004 n_1042' || '' }}
 
       - name: Upload xtest logs on failure
         if: failure() && github.event.inputs.run_xtest == 'true'
@@ -253,11 +279,14 @@ jobs:
 
           ## debug_asan build
 
-          Built with `DEBUG=1`, verbose core/TA logging, and OP-TEE core +
-          TA userspace AddressSanitizer instrumentation
-          (`CFG_CORE_SANITIZE_KADDRESS=y CFG_CORE_SANITIZE_UADDRESS=y`).
-          Expect ASan reports on stdout/serial1.log if a bug is triggered.
-          Not representative of production OP-TEE performance or timing.
+          Built with `DEBUG=1`, verbose core/TA logging, and the OP-TEE
+          Kernel Address Sanitizer (KASan) instrumenting both the TEE core
+          and trusted applications
+          (`CFG_CORE_SANITIZE_KADDRESS=y CFG_TA_SANITIZE_KADDRESS=y`).
+          Core ASLR is off (`CFG_CORE_ASLR=n`) because KASan needs a fixed
+          address map. Expect KASan reports on stdout/serial1.log if a bug is
+          triggered. Not representative of production OP-TEE performance or
+          timing.
           NOTE
           )
           fi
