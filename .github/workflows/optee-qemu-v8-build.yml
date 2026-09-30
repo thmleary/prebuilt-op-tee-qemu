@@ -137,6 +137,21 @@ jobs:
       # it. CFG_ATTESTATION_PTA=n matches upstream's own KASan CI invocations
       # (optee_os ci.yml) - the attestation PTA's memory accounting does not
       # hold up under the shadow map.
+      #
+      # CFG_TEE_RAM_VA_SIZE/CFG_ASAN_SHADOW_OFFSET: with the default 2MB VA
+      # window (CORE_MMU_PGDIR_SIZE) the KASan shadow lands on top of .heap1
+      # and .nozi and the link dies with "TEE_RAM_VA_SIZE is too small".
+      # Widen the window to 4MB - the value upstream's ci.yml uses for this
+      # platform - and recompute the shadow offset, which the platform
+      # hardcodes for the default window and cannot derive in make:
+      #
+      #   shadow_start = ALIGN(TZDRAM_START + VA*8/9 - 8)
+      #   CFG_ASAN_SHADOW_OFFSET = shadow_start - (TZDRAM_START / 8)
+      #
+      # For VA=0x400000, TZDRAM_START=0x0e100000 that is 0xc86e388.
+      # core/arch/arm/kernel/generic_boot.c asserts this at boot, so if
+      # CFG_TZDRAM_START or CFG_TEE_RAM_VA_SIZE ever changes, recompute it.
+      #
       # NOTE: keep these in lockstep with the "Run xtest" step below; every
       # `make` invocation re-derives the config, so `check` must be handed the
       # identical flag set or it rebuilds a different core.
@@ -154,6 +169,8 @@ jobs:
           CFG_TA_SANITIZE_KADDRESS: "y"
           CFG_CORE_ASLR: "n"
           CFG_ATTESTATION_PTA: "n"
+          CFG_TEE_RAM_VA_SIZE: "0x400000"
+          CFG_ASAN_SHADOW_OFFSET: "0xc86e388"
         run: |
           OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
           cd "$OPTEE_DIR/build"
@@ -179,6 +196,8 @@ jobs:
             export CFG_TA_SANITIZE_KADDRESS=y
             export CFG_CORE_ASLR=n
             export CFG_ATTESTATION_PTA=n
+            export CFG_TEE_RAM_VA_SIZE=0x400000
+            export CFG_ASAN_SHADOW_OFFSET=0xc86e388
             make -j"$(nproc)" check \
               DEBUG=1 \
               CFG_TEE_CORE_LOG_LEVEL=4 \
