@@ -35,7 +35,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [release, debug_asan]
+        # Driven by the build_variant dispatch input instead of a fixed list:
+        # previously both legs always built, because nothing but the no-op
+        # "Declare build type" step read the input. `&&`/`||` here emulate a
+        # ternary - each branch is a non-empty literal, so the fallback can
+        # never win by accident.
+        variant: ${{ fromJSON(github.event.inputs.build_variant == 'release' && '["release"]' || github.event.inputs.build_variant == 'debug_asan' && '["debug_asan"]' || '["release","debug_asan"]') }}
     runs-on: ubuntu-22.04
     # The debug_asan variant is DEBUG=1 + KASan: unoptimized, cold ccache and
     # a large shadow map, so it is well over the ~70min the optimized release
@@ -44,7 +49,6 @@ jobs:
 
     steps:
       - name: Declare build type
-        if: ${{ github.event.inputs.build_variant == 'both' || github.event.inputs.build_variant == matrix.variant }}
         run: |
           echo "Building ${{ matrix.variant }}"
 
@@ -216,7 +220,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: optee-qemuv8-${{ matrix.variant }}-xtest-logs
+          # The `check` target tees the console to out/bin/, not build/ - an
+          # earlier version pointed only at build/ and silently uploaded
+          # nothing ("No files were found"), throwing away the KASan reports
+          # this artifact exists to preserve. Both locations are listed since
+          # which one is populated depends on the build system writing it.
           path: |
+            ${{ github.workspace }}/optee-project-${{ matrix.variant }}/out/bin/serial0.log
+            ${{ github.workspace }}/optee-project-${{ matrix.variant }}/out/bin/serial1.log
             ${{ github.workspace }}/optee-project-${{ matrix.variant }}/build/serial0.log
             ${{ github.workspace }}/optee-project-${{ matrix.variant }}/build/serial1.log
           if-no-files-found: ignore
