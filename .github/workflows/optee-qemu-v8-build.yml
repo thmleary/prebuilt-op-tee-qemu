@@ -118,15 +118,28 @@ jobs:
       # debug_asan: DEBUG build with the OP-TEE Kernel Address Sanitizer
       # (KASan) enabled for both the TEE core and trusted applications, plus
       # verbose core/TA logging - useful for finding memory-safety bugs.
+      #
+      # The CFG_* flags below are passed via the step environment, NOT as make
+      # arguments, and that distinction is load-bearing. OPTEE/build assembles
+      # the optee_os invocation from OPTEE_OS_COMMON_EXTRA_FLAGS with `?=` plus
+      # a long chain of `+=` (common.mk:172 onwards), and the first entry is
+      # `O=out/$(ARCH)`. A command-line override of that variable discards the
+      # whole chain: optee_os then falls back to its own default output dir
+      # (out/arm-plat-vexpress) while the build system still hands TF-A
+      # BL32_EXTRA1=.../out/arm/core/tee-pager_v2.bin, so the build dies with
+      # "was specified, but ... does not exist". Environment variables do not
+      # have that effect - `?=` leaves them alone and `+=` still appends - and
+      # optee_os's config.mk picks them up as ordinary config.
+      #
       # CFG_CORE_ASLR=n is mandatory, not cosmetic: mk/config.mk hard-errors
       # with "CFG_CORE_SANITIZE_KADDRESS and CFG_CORE_ASLR are not compatible"
       # and CFG_CORE_ASLR defaults to y, so the sanitizers never build without
       # it. CFG_ATTESTATION_PTA=n matches upstream's own KASan CI invocations
       # (optee_os ci.yml) - the attestation PTA's memory accounting does not
       # hold up under the shadow map.
-      # NOTE: keep these flags and the "Run xtest" step below in lockstep;
-      # every `make` invocation re-derives the config, so `check` must be
-      # handed the identical flag set or it rebuilds a different core.
+      # NOTE: keep these in lockstep with the "Run xtest" step below; every
+      # `make` invocation re-derives the config, so `check` must be handed the
+      # identical flag set or it rebuilds a different core.
       - name: Build OP-TEE (release)
         if: matrix.variant == 'release'
         run: |
@@ -136,15 +149,18 @@ jobs:
 
       - name: Build OP-TEE (debug + KASan)
         if: matrix.variant == 'debug_asan'
+        env:
+          CFG_CORE_SANITIZE_KADDRESS: "y"
+          CFG_TA_SANITIZE_KADDRESS: "y"
+          CFG_CORE_ASLR: "n"
+          CFG_ATTESTATION_PTA: "n"
         run: |
           OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
           cd "$OPTEE_DIR/build"
           make -j"$(nproc)" \
             DEBUG=1 \
             CFG_TEE_CORE_LOG_LEVEL=4 \
-            CFG_TEE_TA_LOG_LEVEL=4 \
-            CFG_ATTESTATION_PTA=n \
-            OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_TA_SANITIZE_KADDRESS=y CFG_CORE_ASLR=n"
+            CFG_TEE_TA_LOG_LEVEL=4
 
       # Optional, off by default: build+boot QEMU headlessly and run xtest.
       # `check` depends on `all` having already been built, so only the
@@ -156,12 +172,17 @@ jobs:
           OPTEE_DIR="${{ github.workspace }}/optee-project-${{ matrix.variant }}"
           cd "$OPTEE_DIR/build"
           if [ "${{ matrix.variant }}" = "debug_asan" ]; then
+            # Exported here rather than set as a step env: an env var set for
+            # the whole step would also apply to the release branch, and
+            # setting it to "" there would shadow the optee_os defaults.
+            export CFG_CORE_SANITIZE_KADDRESS=y
+            export CFG_TA_SANITIZE_KADDRESS=y
+            export CFG_CORE_ASLR=n
+            export CFG_ATTESTATION_PTA=n
             make -j"$(nproc)" check \
               DEBUG=1 \
               CFG_TEE_CORE_LOG_LEVEL=4 \
-              CFG_TEE_TA_LOG_LEVEL=4 \
-              CFG_ATTESTATION_PTA=n \
-              OPTEE_OS_COMMON_EXTRA_FLAGS="CFG_CORE_SANITIZE_KADDRESS=y CFG_TA_SANITIZE_KADDRESS=y CFG_CORE_ASLR=n"
+              CFG_TEE_TA_LOG_LEVEL=4
           else
             make -j"$(nproc)" check
           fi
